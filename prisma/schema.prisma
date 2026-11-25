@@ -1,0 +1,221 @@
+// Prisma 7: gerador novo, client gerado dentro do projeto (ignorado pelo git)
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+// Prisma 7: a URL não fica mais aqui.
+// - CLI (migrate/studio): prisma.config.ts -> DIRECT_URL
+// - Aplicação: lib/prisma.ts (driver adapter) -> DATABASE_URL
+datasource db {
+  provider = "postgresql"
+}
+
+// ==========================================
+// ENTIDADES DO ORQUESTRADOR DE ROTINA
+// ==========================================
+
+model User {
+  id    String  @id @default(uuid())
+  // Sempre salvo normalizado (trim + minúsculas) para "Fulano@X.com" e "fulano@x.com" serem o mesmo usuário
+  email String  @unique
+  // Auth.js: preenchido quando o provedor confirma o e-mail
+  emailVerified DateTime?
+  // Opcional: usuários criados automaticamente pelo login por código ainda não têm nome
+  name  String?
+  // Auth.js: foto de perfil vinda do provedor OAuth
+  image String?
+  // Fuso IANA do usuário: define o que é "hoje" (o servidor roda em UTC)
+  timezone String @default("America/Sao_Paulo")
+
+  // Relações do Auth.js
+  accounts Account[]
+  sessions Session[]
+
+  // Relações do domínio
+  goals    Goal[]
+  habits   Habit[]
+  // Login antigo por código (legado): pode ser removido numa etapa futura
+  otpCodes OtpCode[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ==========================================
+// AUTH.JS (@auth/prisma-adapter)
+// ==========================================
+
+// Vínculo de um User com um provedor OAuth (Google, GitHub...).
+// Os campos snake_case são exigidos pelo adapter (vêm da resposta OAuth).
+model Account {
+  id                String  @id @default(uuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([provider, providerAccountId])
+}
+
+// Sessões ativas (usada com session strategy "database")
+model Session {
+  id           String   @id @default(uuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Só usada se o login por e-mail (magic link) do Auth.js for ativado
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// Códigos de login por e-mail (passwordless). Um registro por código emitido.
+model OtpCode {
+  id String @id @default(uuid())
+
+  // Hash do código (nunca o código em texto puro): quem ler o banco não consegue logar
+  codeHash  String
+  expiresAt DateTime
+
+  // Tentativas erradas neste código; ao atingir o limite ele é invalidado (anti força bruta)
+  attempts   Int       @default(0)
+  // Preenchido quando o código é usado com sucesso ou invalidado; código consumido nunca vale de novo
+  consumedAt DateTime?
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  // Busca do código ativo mais recente do usuário (verify) e contagem de envios recentes (rate limit)
+  @@index([userId, createdAt])
+}
+
+// Metas Macro (ex: "Conseguir vaga de Fullstack")
+model Goal {
+  id          String  @id @default(uuid())
+  title       String
+  description String?
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  projects Project[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Projetos Filhos (ex: "Avançar no BugTrack", "Algoritmos do Galego")
+model Project {
+  id    String @id @default(uuid())
+  title String
+
+  goalId String
+  goal   Goal   @relation(fields: [goalId], references: [id])
+
+  tasks Task[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Tarefas: avulsas (uma data exata) ou de rotina semanal (um dia da semana)
+model Task {
+  id    String @id @default(uuid())
+  title String // ex: "Resolver 3 problemas no LeetCode"
+
+  // Exatamente UM dos dois é preenchido (garantido por CHECK no banco, ver migration)
+  // Tarefa avulsa: só a data do calendário, sem hora/fuso (ex: 2026-11-25)
+  date      DateTime? @db.Date
+  // Rotina semanal: 0 = Domingo ... 6 = Sábado (mesmo padrão do Date.getDay() e dayjs().day())
+  dayOfWeek Int?
+  // Só para rotinas: último dia (inclusive) em que a rotina aparece. Encerrar em vez de apagar
+  // preserva o histórico do TaskLog. Nulo = rotina ativa.
+  endedAt   DateTime? @db.Date
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+
+  // Conclusão e pomodoro ficam por dia: uma rotina de segunda tem um registro por segunda
+  logs TaskLog[]
+
+  // Rotina semanal só aparece a partir do dia em que foi criada
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+  @@index([dayOfWeek])
+}
+
+// Estado de uma tarefa num dia específico (conclusão + tempo de pomodoro)
+model TaskLog {
+  id String @id @default(uuid())
+
+  date            DateTime @db.Date
+  completed       Boolean  @default(false)
+  pomodoroMinutes Int      @default(0)
+
+  taskId String
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // No máximo um registro por tarefa por dia
+  @@unique([taskId, date])
+  // Busca dos registros de um dia (listagem do Dashboard)
+  @@index([date])
+}
+
+// Hábitos recorrentes (ex: "Ler 20 páginas", "Treinar")
+model Habit {
+  id    String @id @default(uuid())
+  title String
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  logs HabitLog[]
+
+  createdAt DateTime @default(now())
+}
+
+// Registro de check diário de um hábito
+model HabitLog {
+  id String @id @default(uuid())
+
+  // Dia do check no formato "YYYY-MM-DD" (string evita problemas de fuso horário)
+  date String
+
+  habitId String
+  habit   Habit  @relation(fields: [habitId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  // Garante no máximo um check por hábito por dia
+  @@unique([habitId, date])
+}
